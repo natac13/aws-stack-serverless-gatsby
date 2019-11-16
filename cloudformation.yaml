@@ -1,9 +1,24 @@
 ---
 AWSTemplateFormatVersion: "2010-09-09"
 
-Description: "Create stack for hosting a gatsby rendered website"
+Description: "Create stack for hosting a gatsby rendered website on S3 with CloudFront"
 
 Parameters:
+  MyIp:
+    Description: "The IP address to access DevTest Bucket"
+    Type: String
+    MinLength: "9"
+    MaxLength: "18"
+    Default: "0.0.0.0/0"
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: "Must be a valid IP CIDR range of the form x.x.x.x/x."
+
+  EmailAddress:
+    Description: "Email address to approve production deployments"
+    Type: String
+    MinLength: 8
+    MaxLength: 255
+
   DomainName:
     Type: String
     Description: "Domain without www"
@@ -12,16 +27,19 @@ Parameters:
     AllowedPattern: "[a-z0-9]+[-.a-z0-9]*(\\.[a-z][a-z]+)+"
     ConstraintDescription: "Provide a valid domain name using only lowercase letters, numbers, and dash (-)"
 
-  CertificateArn:
+  PriceClass:
     Type: String
-    Description: "Provide cert created within us-east-1 region - unfortunately it has to be there because Cloudfront is only within that region."
-    MinLength: 2
-    ConstraintDescription: "Provice a valie cert arn created within use-east-1"
-    
+    Description: The CloudFront distribution price class
+    Default: "PriceClass_100"
+    AllowedValues:
+      - "PriceClass_100"
+      - "PriceClass_200"
+      - "PriceClass_All"
+
   DefaultTTL:
     Type: Number
     Description: "TTL in seconds"
-    Default: 30
+    Default: 4320
 
   MinimumTTL:
     Description: "Minimum cache lifetime in seconds for the CloudFront distribution"
@@ -29,7 +47,6 @@ Parameters:
     Type: Number
 
 Resources:
-   
   #### S3 BUCKETS
   # Bucket for CloudFront and S3 access logs: logs.example.com
   LogsBucket:
@@ -37,30 +54,171 @@ Resources:
     Properties:
       BucketName: !Sub "logs.${DomainName}"
       AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
     DeletionPolicy: Delete
 
   # Bucket for site content: www.example.com
   SiteBucket:
     Type: "AWS::S3::Bucket"
     Properties:
-      BucketName: !Sub "www.${DomainName}"
+      BucketName: !Ref DomainName
       AccessControl: PublicRead
+      LoggingConfiguration:
+        DestinationBucketName: !Ref "LogsBucket"
+        LogFilePrefix: website-logs
       WebsiteConfiguration:
         IndexDocument: index.html
         ErrorDocument: 404.html
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: !Ref DomainName
+          Value: Production
     DeletionPolicy: Delete
 
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action: "s3:GetObject"
+            Principal: "*"
+            Resource: !Sub "${SiteBucket.Arn}/*"
+
   # Bucket to redirect to www.example.com: example.com
-  RedirectBucket:
+  DevTestBucket:
     Type: "AWS::S3::Bucket"
     Properties:
-      BucketName: !Ref DomainName
-      AccessControl: BucketOwnerFullControl
+      BucketName: !Sub "dev.${DomainName}"
+      LoggingConfiguration:
+        DestinationBucketName: !Ref "LogsBucket"
+        LogFilePrefix: devtesting-logs
       WebsiteConfiguration:
-        RedirectAllRequestsTo:
-          HostName: !Sub "www.${DomainName}"
-          Protocol: https
+        IndexDocument: index.html
+        ErrorDocument: 404.html
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: !Ref DomainName
+          Value: Production
     DeletionPolicy: Delete
+
+  DevTestBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DevTestBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action: "s3:GetObject"
+            Principal: "*"
+            Resource: !Sub "${DevTestBucket.Arn}/*"
+            Condition:
+              IpAddress:
+                aws:SourceIp:
+                  - !Ref MyIp
+
+  #### RUN
+  # CDN serves S3 content over HTTPS for www.example.com
+  CloudFrontDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Aliases:
+          - !Ref DomainName
+          - !Sub "www.${DomainName}"
+        PriceClass: !Ref PriceClass # Use Only US, Canada and Europe
+        Origins:
+          - DomainName:
+              !Join [
+                "",
+                [
+                  !Ref SiteBucket,
+                  ".",
+                  !FindInMap [RegionMap, !Ref "AWS::Region", websiteendpoint],
+                ],
+              ]
+            Id: !Ref DomainName
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginKeepaliveTimeout: 5
+              OriginProtocolPolicy: "https-only"
+              OriginReadTimeout: 30
+              OriginSSLProtocols:
+                - TLSv1
+                - TLSv1.1
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: !Ref DomainName
+          AllowedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          DefaultTTL: !Ref DefaultTTL
+          MinTTL: !Ref MinimumTTL
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+        # logs.example.com/logs/cloudfront/www.example.com/
+        DefaultRootObject: "index.html"
+        Logging:
+          Bucket: !GetAtt LogsBucket.DomainName
+          Prefix: !Sub "logs/cloudfront/${DomainName}/"
+          IncludeCookies: false
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Cert
+          MinimumProtocolVersion: TLSv1.1_2016
+          SslSupportMethod: sni-only
+
+  # DNS: example.com, www.example.com
+  Cert:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub "*.${DomainName}"
+      SubjectAlternativeNames:
+        - !Sub "*.${DomainName}"
+        - !Ref DomainName
+      ValidationMethod: DNS
+
+  Route53RecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Sub "${DomainName}."
+      RecordSets:
+        - Name: !Ref DomainName
+          Type: A
+          AliasTarget:
+            DNSName: !GetAtt CloudFrontDistribution.DomainName
+            EvaluateTargetHealth: false
+            HostedZoneId: Z2FDTNDATAQYW2
+        - Name: !Sub "www.${DomainName}"
+          Type: A
+          AliasTarget:
+            DNSName: !GetAtt CloudFrontDistribution.DomainName
+            EvaluateTargetHealth: false
+            HostedZoneId: Z2FDTNDATAQYW2
+        - Name: !Sub "dev.${DomainName}"
+          Type: A
+          AliasTarget:
+            DNSName: !FindInMap [RegionMap, !Ref "AWS::Region", websiteendpoint]
+            EvaluateTargetHealth: false
+            HostedZoneId:
+              !FindInMap [RegionMap, !Ref "AWS::Region", S3hostedzoneID]
 
   # Bucket for CodePipeline artifact storage: codepipeline.example.com
   CodePipelineBucket:
@@ -74,7 +232,7 @@ Resources:
   #### DEVELOPMENT
   CodeCommit:
     Type: "AWS::CodeCommit::Repository"
-    Properties: 
+    Properties:
       RepositoryDescription: !Sub "Git Repository for ${DomainName}"
       RepositoryName: !Ref DomainName
 
@@ -88,46 +246,129 @@ Resources:
           referenceName: [master]
           referenceType: [branch]
         detail-type: [CodeCommit Repository State Change]
-        resources: [!GetAtt 'CodeCommit.Arn']
+        resources: [!GetAtt "CodeCommit.Arn"]
         source: [aws.codecommit]
-      Name: !Join ['-', [!Ref 'AWS::StackName', SourceEvent]]
+      Name: !Join ["-", [!Ref "AWS::StackName", SourceEvent]]
       State: ENABLED
-      Targets: [{
-        Arn: !Join [':', [arn, aws, codepipeline, !Ref 'AWS::Region', !Ref 'AWS::AccountId', !Sub "${AWS::StackName}-codepipeline"]],
-        Id: ProjectPipelineTarget,
-        RoleArn: !GetAtt 'SourceEventRole.Arn'
-      }]
+      Targets:
+        [
+          {
+            Arn:
+              !Join [
+                ":",
+                [
+                  arn,
+                  aws,
+                  codepipeline,
+                  !Ref "AWS::Region",
+                  !Ref "AWS::AccountId",
+                  !Sub "${AWS::StackName}-codepipeline",
+                ],
+              ],
+            Id: ProjectPipelineTarget,
+            RoleArn: !GetAtt "SourceEventRole.Arn",
+          },
+        ]
     Type: AWS::Events::Rule
-  
+
   SourceEventRole:
     Description: IAM role to allow Amazon CloudWatch Events to trigger AWS CodePipeline execution
     Properties:
       AssumeRolePolicyDocument:
-        Statement: [{Action: 'sts:AssumeRole', Effect: Allow, Principal: {Service: [events.amazonaws.com]}, Sid: 1}]
-      Policies: [{
-        PolicyDocument: {
-          Statement: [{
-            Action: ['codepipeline:StartPipelineExecution'],
-            Effect: Allow, 
-            Resource: [!Join [':', [arn, aws, codepipeline, !Ref 'AWS::Region',!Ref 'AWS::AccountId', !Sub "${AWS::StackName}-codepipeline"]]]
-          }]
-        },
-        PolicyName: !Sub "${AWS::StackName}CloudWatchEventPolicy"
-      }]
+        Statement:
+          [
+            {
+              Action: "sts:AssumeRole",
+              Effect: Allow,
+              Principal: { Service: [events.amazonaws.com] },
+              Sid: 1,
+            },
+          ]
+      Policies:
+        [
+          {
+            PolicyDocument:
+              {
+                Statement:
+                  [
+                    {
+                      Action: ["codepipeline:StartPipelineExecution"],
+                      Effect: Allow,
+                      Resource:
+                        [
+                          !Join [
+                            ":",
+                            [
+                              arn,
+                              aws,
+                              codepipeline,
+                              !Ref "AWS::Region",
+                              !Ref "AWS::AccountId",
+                              !Sub "${AWS::StackName}-codepipeline",
+                            ],
+                          ],
+                        ],
+                    },
+                  ],
+              },
+            PolicyName: !Sub "${AWS::StackName}CloudWatchEventPolicy",
+          },
+        ]
     Type: AWS::IAM::Role
 
-  GatsbyCodeBuildRole:
-    Type: AWS::IAM::Role
+  CodeBuildRole:
+    Type: "AWS::IAM::Role"
     Properties:
       AssumeRolePolicyDocument:
-        Version: "2012-10-17"
         Statement:
-          Effect: Allow
-          Principal:
-            Service: codebuild.amazonaws.com
-          Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AdministratorAccess
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+        Version: 2012-10-17
+      Path: "/"
+
+  CodeBuildPolicy:
+    Type: "AWS::IAM::Policy"
+    DependsOn:
+      - CodeBuildRole
+    Properties:
+      PolicyName: !Sub "CodeBuildServiceRolePolicy-${DomainName}"
+      Roles:
+        - !Ref CodeBuildRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Resource: "*"
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+          - Effect: Allow
+            Resource: !GetAtt [CodePipelineBucket, Arn]
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:GetBucketAcl
+              - s3:GetBucketLocation
+          - Effect: Allow
+            Resource: !GetAtt [CodeCommit, Arn]
+            Action:
+              - codecommit:GitPull
+          - Effect: Allow
+            Resource:
+              - !GetAtt [SiteBucket, Arn]
+              - !Join ["", ["arn:aws:s3:::", !Ref "SiteBucket", /*]]
+            Action:
+              - s3:PutObject
+              - s3:GetBucketAcl
+              - s3:GetBucketLocation
+              - s3:ListObjects
+              - s3:GetObject
+              - s3:ListBucket
 
   GatsbyCodeBuild:
     Type: AWS::CodeBuild::Project
@@ -136,19 +377,22 @@ Resources:
         Type: CODEPIPELINE
       Environment:
         ComputeType: BUILD_GENERAL1_SMALL
-        Image: aws/codebuild/nodejs:6.3.1
+        Image: aws/codebuild/standard:2.0-1.13.0
         Type: LINUX_CONTAINER
         EnvironmentVariables:
           - Name: DESTINATION_S3_BUCKET
-            Value: !Sub "www.${DomainName}"
+            Value: !Sub "dev.${DomainName}"
       Name: !Sub "${AWS::StackName}-codebuild"
-      ServiceRole: !Ref GatsbyCodeBuildRole
+      ServiceRole: !Ref CodeBuildRole
       Source:
         Type: CODEPIPELINE
         BuildSpec: |
           version: 0.2
           phases:
             install:
+              runtime-versions:
+                nodejs: 10
+                docker: 18
               commands:
                 - touch .npmignore
                 - npm install -g gatsby
@@ -165,24 +409,119 @@ Resources:
             base-directory: public
             files:
               - "**/*"
+            discard-paths: no
+          cache:
+            paths:
+              - '.cache/*'
+              - 'node_modules/*'
+              - 'public/*'
 
-  #### DEPLOY
-  # IAM info for CodePipeline
-  CodePipelineRole:
+  GatsbyCodePipelineRole:
     Type: "AWS::IAM::Role"
     Properties:
       AssumeRolePolicyDocument:
-        Version: "2012-10-17"
         Statement:
-          Effect: Allow
-          Principal:
-            Service: "codepipeline.amazonaws.com"
-          Action: "sts:AssumeRole"
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AdministratorAccess
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+        Version: 2012-10-17
+      Path: "/"
 
-  # CodePipeline: Pass Git contents to AWS Lambda function on Git activity
+  GatsbyCodePipelinePolicy:
+    Type: "AWS::IAM::Policy"
+    DependsOn:
+      - GatsbyCodePipelineRole
+    Properties:
+      PolicyName: !Sub "CodePipelineServiceRolePolicy-${DomainName}"
+      Roles:
+        - !Ref GatsbyCodePipelineRole
+      PolicyDocument:
+        Statement:
+          - Action:
+              - "iam:PassRole"
+            Resource: "*"
+            Effect: Allow
+            Condition:
+              StringEqualsIfExists:
+                "iam:PassedToService":
+                  - cloudformation.amazonaws.com
+          - Action:
+              - "codecommit:CancelUploadArchive"
+              - "codecommit:GetBranch"
+              - "codecommit:GetCommit"
+              - "codecommit:GitPull"
+              - "codecommit:GetUploadArchiveStatus"
+              - "codecommit:UploadArchive"
+            Resource: "*"
+            Effect: Allow
+          - Action:
+              - "codedeploy:CreateDeployment"
+              - "codedeploy:GetApplication"
+              - "codedeploy:GetApplicationRevision"
+              - "codedeploy:GetDeployment"
+              - "codedeploy:GetDeploymentConfig"
+              - "codedeploy:RegisterApplicationRevision"
+            Resource: "*"
+            Effect: Allow
+          - Action:
+              - "cloudwatch:*"
+              - "s3:*"
+              - "sns:*"
+              - "cloudformation:*"
+              - "sqs:*"
+            Resource: "*"
+            Effect: Allow
+          - Action:
+              - "lambda:InvokeFunction"
+              - "lambda:ListFunctions"
+            Resource: "*"
+            Effect: Allow
+          - Action:
+              - "cloudformation:CreateStack"
+              - "cloudformation:DeleteStack"
+              - "cloudformation:DescribeStacks"
+              - "cloudformation:UpdateStack"
+              - "cloudformation:CreateChangeSet"
+              - "cloudformation:DeleteChangeSet"
+              - "cloudformation:DescribeChangeSet"
+              - "cloudformation:ExecuteChangeSet"
+              - "cloudformation:SetStackPolicy"
+              - "cloudformation:ValidateTemplate"
+            Resource: "*"
+            Effect: Allow
+          - Action:
+              - "codebuild:BatchGetBuilds"
+              - "codebuild:StartBuild"
+            Resource: "*"
+            Effect: Allow
+          - Effect: Allow
+            Action:
+              - "servicecatalog:ListProvisioningArtifacts"
+              - "servicecatalog:CreateProvisioningArtifact"
+              - "servicecatalog:DescribeProvisioningArtifact"
+              - "servicecatalog:DeleteProvisioningArtifact"
+              - "servicecatalog:UpdateProduct"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - "cloudformation:ValidateTemplate"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - "ecr:DescribeImages"
+            Resource: "*"
+        Version: 2012-10-17
+
+    # CodePipeline: Pass Git contents to AWS Lambda function on Git activity
+
   CodePipeline:
+    DependsOn:
+      - GatsbyProdApprovalTopic
+      - GatsbyCodePipelineRole
+      - CodePipelineBucket
+      - CodeCommit
     Type: "AWS::CodePipeline::Pipeline"
     Properties:
       Name: !Sub "${AWS::StackName}-codepipeline"
@@ -190,7 +529,7 @@ Resources:
         Type: S3
         Location: !Ref CodePipelineBucket
       RestartExecutionOnUpdate: false
-      RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${CodePipelineRole}"
+      RoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${GatsbyCodePipelineRole}"
       Stages:
         - Name: Source
           Actions:
@@ -222,120 +561,51 @@ Resources:
               OutputArtifacts:
                 - Name: StaticFiles
               RunOrder: 1
+        - Name: Production-Deploy
+          Actions:
+            - Name: ApproveChangeSet
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: "1"
+              Configuration:
+                NotificationArn: !Ref GatsbyProdApprovalTopic
+                ExternalEntityLink: !Sub "http://dev.${DomainName}"
+                CustomData: !Sub "A new build of ${DomainName} was created. Do you want to implement the changes?"
+              RunOrder: "1"
+            - Name: DeployProductionSite
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: S3
+                Version: "1"
+              Configuration:
+                BucketName: !Ref DomainName
+                Extract: true
+                CannedACL: public-read
+              InputArtifacts:
+                - Name: StaticFiles
+              RunOrder: "2"
 
-  #### RUN
-  # Certificate for HTTPS accesss through CloudFront
-  # !!! Created manually since it has to be created within us-east-1 !!!
+  GatsbyProdApprovalTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: !Sub "${DomainName}-Prod-approval"
+      Tags:
+        - Key: Application
+          Value: !Sub "${DomainName}"
+      TopicName: Prod-approval
 
-  # CDN serves S3 content over HTTPS for www.example.com
-  CloudFrontDistribution:
-    Type: "AWS::CloudFront::Distribution"
+  GatsbyProdApprovalSubscription:
+    DependsOn:
+      - GatsbyProdApprovalTopic
+    Type: "AWS::SNS::Subscription"
     Properties:
-      DistributionConfig:
-        Enabled: true
-        Aliases:
-          - !Sub "www.${DomainName}"
-        PriceClass: PriceClass_100 # Use Only US, Canada and Europe
-        Origins:
-          -
-            DomainName: !Join ["", [
-              !Sub "www.${DomainName}", ".", 
-              !FindInMap [RegionMap, !Ref "AWS::Region", websiteendpoint]
-            ]]
-            Id: S3Origin
-            CustomOriginConfig:
-              HTTPPort: 80
-              HTTPSPort: 443
-              OriginProtocolPolicy: http-only
-        DefaultCacheBehavior:
-          TargetOriginId: S3Origin
-          AllowedMethods:
-            - GET
-            - HEAD
-          Compress: true
-          DefaultTTL: !Ref DefaultTTL
-          MinTTL: !Ref MinimumTTL
-          ForwardedValues:
-            QueryString: false
-            Cookies:
-              Forward: none
-          ViewerProtocolPolicy: redirect-to-https
-        # logs.example.com/logs/cloudfront/www.example.com/
-        Logging:
-          Bucket: !Join ["", [!Ref LogsBucket, ".s3.amazonaws.com"]]
-          Prefix: !Sub "logs/cloudfront/www.${DomainName}/"
-          IncludeCookies: false
-        ViewerCertificate:
-          AcmCertificateArn: !Ref CertificateArn
-          SslSupportMethod: sni-only
-
-  # CDN serves S3 content over HTTPS for example.com
-  RedirectCloudFrontDistribution:
-    Type: "AWS::CloudFront::Distribution"
-    Properties:
-      DistributionConfig:
-        Enabled: true
-        Aliases:
-          - !Ref RedirectBucket
-        PriceClass: PriceClass_100 # Use Only US, Canada and Europe
-        Origins:
-          -
-            DomainName: !Join ["", [!Ref RedirectBucket, ".", !FindInMap [RegionMap, !Ref "AWS::Region", websiteendpoint]]]
-            Id: RedirectS3Origin
-            CustomOriginConfig:
-              HTTPPort: 80
-              HTTPSPort: 443
-              OriginProtocolPolicy: http-only
-        DefaultCacheBehavior:
-          TargetOriginId: RedirectS3Origin
-          AllowedMethods:
-            - GET
-            - HEAD
-          DefaultTTL: !Ref DefaultTTL
-          MinTTL: !Ref MinimumTTL
-          ForwardedValues:
-            QueryString: false
-            Cookies:
-             Forward: none
-          ViewerProtocolPolicy: allow-all
-        # logs.example.com/logs/cloudfront/example.com/
-        Logging:
-          Bucket: !Join ["", [!Ref LogsBucket, ".s3.amazonaws.com"]]
-          Prefix: !Sub "logs/cloudfront/${DomainName}/"
-          IncludeCookies: false
-        ViewerCertificate:
-          AcmCertificateArn: !Ref CertificateArn
-          SslSupportMethod: sni-only
-
-  # DNS: example.com, www.example.com
-  Route53HostedZone:
-    Type: "AWS::Route53::HostedZone"
-    Properties:
-      HostedZoneConfig:
-        Comment: !Sub "Created by CloudFormation stack: ${AWS::StackName}"
-      Name: !Ref DomainName
-    DeletionPolicy: Delete
-  
-  Route53RecordSetGroup:
-    Type: "AWS::Route53::RecordSetGroup"
-    Properties:
-      HostedZoneId: !Ref Route53HostedZone
-      HostedZoneName: !Ref "AWS::NoValue"
-      RecordSets:
-        # example.com
-        - Name: !Sub "${DomainName}."
-          Type: A
-          # Resolve to CloudFront distribution
-          AliasTarget:
-            HostedZoneId: Z2FDTNDATAQYW2 # CloudFront
-            DNSName: !GetAtt RedirectCloudFrontDistribution.DomainName
-        # www.example.com
-        - Name: !Sub "www.${DomainName}."
-          Type: A
-          # Resolve to CloudFront distribution
-          AliasTarget:
-            HostedZoneId: Z2FDTNDATAQYW2 # CloudFront
-            DNSName: !GetAtt CloudFrontDistribution.DomainName
+      Endpoint: !Ref EmailAddress
+      Protocol: email
+      Region: !Ref "AWS::Region"
+      TopicArn: !Ref GatsbyProdApprovalTopic
 
 Outputs:
   DomainName:
@@ -343,8 +613,8 @@ Outputs:
     Value: !Ref DomainName
   SiteBucket:
     Value: !Ref SiteBucket
-  RedirectBucket:
-    Value: !Ref RedirectBucket
+  DevTestBucket:
+    Value: !Ref DevTestBucket
 
 Mappings:
   RegionMap:
@@ -384,6 +654,4 @@ Mappings:
     us-west-2:
       S3hostedzoneID: "Z3BJ6K6RIION7M"
       websiteendpoint: "s3-website-us-west-2.amazonaws.com"
-
-
 # Metadata:
